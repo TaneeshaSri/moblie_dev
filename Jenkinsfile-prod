@@ -1,0 +1,97 @@
+pipeline {
+    agent any
+    environment {
+        registry = '767398058704.dkr.ecr.us-east-1.amazonaws.com'
+        registryImage = 'moksa_ai-ecr-mobile-detection'
+        registryImageTag = "latest-prod-${BUILD_NUMBER}"
+        SCANNER_HOME = tool 'sonar-scanner'
+        GIT_REPO_URL = 'git@github.com:moksa-ai/customer-helm-charts.git'
+        BRANCH = 'main'
+        GIT_CREDENTIALS_ID = 'git-jen-ssh-key'
+        GIT_USERNAME = 'Sagarkeesara'
+        GIT_EMAIL = 'sagar.k@moksa.ai'
+
+    }
+    stages {
+        stage('Checkout Source') {
+            steps {
+                git branch: "tani_dev",
+                    credentialsId: GIT_CREDENTIALS_ID,
+                    url: 'git@github.com:moksa-ai/mobile_detection.git'
+            }
+        }
+
+        stage('Trivy Filesystem Scan') {
+            steps {
+                sh 'trivy fs --format table -o trivy-fs-report.html .'
+            }
+        }
+
+        stage('Building image') {
+            steps {
+                script {
+                    dockerImage = docker.build("${registry}/${registryImage}:${registryImageTag}")
+                }
+            }
+        }
+
+        // stage('Trivy Image Scan') {
+        //     steps {
+        //         sh "trivy image --format table \
+        //                   -o trivy-image-report.html ${registry}/${registryImage}:${registryImageTag}"
+        //     }
+        // }
+
+        stage('Pushing to ECR') {
+            steps {
+                script {
+                    withCredentials([[
+                        $class: 'AmazonWebServicesCredentialsBinding',
+                        credentialsId: 'aws-cred',
+                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                    ]]) {
+                        sh "aws ecr get-login-password --region us-east-1 | \
+                            docker login --username AWS --password-stdin ${registry}"
+                        sh "docker push ${registry}/${registryImage}:${registryImageTag}"
+                    }
+                }
+            }
+        }
+
+        // stage('Archive Trivy Reports') {
+        //     steps {
+        //         archiveArtifacts artifacts: 'trivy-image-report.html, trivy-fs-report.html', fingerprint: true
+        //     }
+        // }
+        stage('Checkout customer-helm-charts repo') {
+            steps {
+                git branch: BRANCH,
+                    credentialsId: GIT_CREDENTIALS_ID,
+                    url: GIT_REPO_URL
+            }
+        }
+        stage('Commit and Push Changes') {
+            steps {
+                script {
+                    sshagent([GIT_CREDENTIALS_ID]) {
+                        sh """
+                        wget -qO yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+                        chmod a+x ./yq
+                        UPDATED_FILES=""
+                        for file in \$(find . -type f -name 'values.yaml'); do
+                            ./yq eval '.image.mobiledetection = (.image.mobiledetection | split(":")[0] + ":" + strenv(registryImageTag))' -i \$file
+                            UPDATED_FILES="\$UPDATED_FILES \$file"
+                        done
+                        git config user.name ${GIT_USERNAME}
+                        git config user.email ${GIT_EMAIL}
+                        git add \$UPDATED_FILES
+                        git commit -m "Update docker image to ${registryImageTag} for mobile-detection"
+                        git push origin ${BRANCH}
+                        """
+                    }
+                }
+            }
+        }
+    }
+}
